@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""
+3D LiDAR Obstacle Avoidance v1.0
+PX4 + Gazebo Harmonic + ROS 2 Jazzy
+"""
+
+import asyncio
+import math
+import os
+import threading
+import time
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, List, Tuple, Dict
+
+import numpy as np
+import rclpy
+from mavsdk import System
+from mavsdk.offboard import OffboardError, VelocityBodyYawspeed
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import PointCloud2
+import sensor_msgs_py.point_cloud2 as pc2
+
+
+class State(Enum):
+    CRUISE = auto()
+    AVOID = auto()
+    BYPASS = auto()
+    RECOVER = auto()
+
+
+@dataclass
+class Obstacle:
+    direction: str
+    distance: float
+    timestamp: float
+
+
+class Lidar3DAvoidance(Node):
+    WAYPOINTS: List[Tuple[float, float]] = [
+        (40.0, 0.0), (40.0, 40.0), (0.0, 40.0), (0.0, 0.0),
+    ]
+    WP_TOLERANCE_M = 3.0
+    MAX_SPEED = 1.5
+    MIN_SPEED = 0.2
+    CRUISE_YAW_RATE = 20.0
+    SPEED_RAMP_RATE = 0.4
+    YAW_RAMP_RATE = 10.0
+
+    LIDAR_TOPIC = "/lidar_3d/points/points"
+    LIDAR_MIN_M = 0.3
+    LIDAR_MAX_M = 30.0
+
+    SECTORS = {
+        "front_left": (-60, -15),
+        "front_center": (-15, 15),
+        "front_right": (15, 60),
+        "left": (-100, -60),
+        "right": (60, 100),
+    }
+
+    VERTICAL_FOV_CROP = math.radians(25.0)
+
+    AVOID_LATERAL_SPEED = 1.2
+    AVOID_FORWARD_SPEED = 0.3
+    BYPASS_DURATION_S = 2.5
+    BYPASS_FORWARD = 0.2
+    RECOVER_DURATION_S = 1.5
+    OBSTACLE_MEMORY_S = 2.0
+    DISTANCE_EMA_ALPHA = 0.4
+
+    def __init__(self):
+        super().__init__("lidar_3d_avoidance")
+        self.create_subscription(PointCloud2, self.LIDAR_TOPIC, self._lidar_cb, qos_profile_sensor_data)
+        self.get_logger().info(f"3D LiDAR subscriber: {self.LIDAR_TOPIC}")
+
+        self.lidar_count = 0
+        self.last_lidar_time = 0.0
+        self.current_wp_idx = 0
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.current_heading = 0.0
+        self.state = State.CRUISE
+        self.state_start_time = 0.0
+        self.avoid_direction = 0.0
+        self.airborne = False
+        self.altitude = 5.0
+        self.current_speed = 0.0
+        self.current_yaw_rate = 0.0
+        self.current_lateral = 0.0
+        self.obstacles: Dict[str, Obstacle] = {}
+        self.obstacle_ema: Dict[str, float] = {}
+        self.last_avoid_time = 0.0
+
+    def _lidar_cb(self, msg: PointCloud2):
+        self.lidar_count += 1
+        self.last_lidar_time = time.time()
+
+        try:
+            points = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
+            if len(points) == 0:
+                return
+
+            pts = np.array(points)
+            x = pts['x'].astype(np.float32)
+            y = pts['y'].astype(np.float32)
+            z = pts['z'].astype(np.float32)
+            ranges = np.sqrt(x*x + y*y + z*z)
+            azimuth = np.arctan2(y, x)
+            horizontal_dist = np.sqrt(x*x + y*y)
+            elevation = np.arctan2(z, horizontal_dist)
+
+            valid = (
+                (ranges > self.LIDAR_MIN_M) &
+                (ranges < self.LIDAR_MAX_M) &
+                (np.abs(elevation) < self.VERTICAL_FOV_CROP)
+            )
+
+            if not np.any(valid):
+                return
+
+            valid_az = azimuth[valid]
+            valid_ranges = ranges[valid]
+            now = time.time()
+
+            for name, (deg_min, deg_max) in self.SECTORS.items():
+                rad_min = math.radians(deg_min)
+                rad_max = math.radians(deg_max)
+
+                if rad_min > rad_max:
+                    sector_mask = (valid_az >= rad_min) | (valid_az < rad_max)
+                else:
+                    sector_mask = (valid_az >= rad_min) & (valid_az < rad_max)
+
+                if not np.any(sector_mask):
+                    continue
+
+                sector_ranges = valid_ranges[sector_mask]
+                dist = float(np.percentile(sector_ranges, 10))
+
+                if name in self.obstacle_ema:
+                    self.obstacle_ema[name] = (
+                        self.DISTANCE_EMA_ALPHA * dist +
+                        (1 - self.DISTANCE_EMA_ALPHA) * self.obstacle_ema[name]
+                    )
+                else:
+                    self.obstacle_ema[name] = dist
+
+                self.obstacles[name] = Obstacle(name, self.obstacle_ema[name], now)
+
+            if self.lidar_count % 20 == 0:
+                fl = self.obstacle_ema.get("front_left", float('inf'))
+                fc = self.obstacle_ema.get("front_center", float('inf'))
+                fr = self.obstacle_ema.get("front_right", float('inf'))
+                self.get_logger().info(
+                    f"3D LIDAR #{self.lidar_count}: pts={len(pts)}, FL={fl:.1f}, FC={fc:.1f}, FR={fr:.1f}"
+                )
+
+        except Exception as e:
+            self.get_logger().error(f"3D LiDAR callback error: {e}")
+
+    def _get_front_obstacles(self) -> List[Obstacle]:
+        now = time.time()
+        front_dirs = {"front_left", "front_center", "front_right"}
+        obs = []
+        for k, o in list(self.obstacles.items()):
+            if now - o.timestamp > self.OBSTACLE_MEMORY_S:
+                del self.obstacles[k]
+                if k in self.obstacle_ema:
+                    del self.obstacle_ema[k]
+                continue
+            if o.direction in front_dirs:
+                obs.append(o)
+        return obs
+
+    def _get_all_obstacles(self) -> List[Obstacle]:
+        now = time.time()
+        obs = []
+        for k, o in list(self.obstacles.items()):
+            if now - o.timestamp > self.OBSTACLE_MEMORY_S:
+                del self.obstacles[k]
+                if k in self.obstacle_ema:
+                    del self.obstacle_ema[k]
+                continue
+            obs.append(o)
+        return obs
+
+    def _get_closest(self, obstacles: List[Obstacle]) -> Optional[Obstacle]:
+        if not obstacles:
+            return None
+        return min(obstacles, key=lambda o: o.distance)
+
+    def _ramp_value(self, current: float, target: float, max_delta: float) -> float:
+        delta = target - current
+        if abs(delta) <= max_delta:
+            return target
+        return current + math.copysign(max_delta, delta)
+
+    def update_state(self, heading: float, x: float, y: float, alt: float):
+        now = time.time()
+        self.current_heading = heading
+        self.pos_x = x
+        self.pos_y = y
+        self.altitude = alt
+
+        front_obs = self._get_front_obstacles()
+        closest_front = self._get_closest(front_obs)
+        all_obs = self._get_all_obstacles()
+
+        wx, wy = self.WAYPOINTS[self.current_wp_idx]
+        dx = wx - x
+        dy = wy - y
+        dist_to_wp = math.hypot(dx, dy)
+        bearing = math.degrees(math.atan2(dy, dx))
+        hdg_err = heading_error(bearing, heading)
+
+        if dist_to_wp < self.WP_TOLERANCE_M and self.state == State.CRUISE:
+            self._advance_wp()
+            wx, wy = self.WAYPOINTS[self.current_wp_idx]
+            dx = wx - x
+            dy = wy - y
+            dist_to_wp = math.hypot(dx, dy)
+            bearing = math.degrees(math.atan2(dy, dx))
+            hdg_err = heading_error(bearing, heading)
+
+        react_dist = self.current_speed * 2.5
+        stop_dist = max(1.5, react_dist * 0.5)
+        warn_dist = max(3.0, react_dist * 1.0)
+
+        threat = False
+        threat_dist = 999.0
+        threat_dir = "none"
+
+        if closest_front and (now - self.last_avoid_time) > 1.0:
+            threat_dist = closest_front.distance
+            threat_dir = closest_front.direction
+            if threat_dist < stop_dist:
+                threat = True
+            elif threat_dist < warn_dist:
+                threat = True
+
+        target_speed = 0.0
+        target_lateral = 0.0
+        target_yaw_rate = 0.0
+
+        emergency = False
+        if closest_front and closest_front.distance < 1.0:
+            emergency = True
+            target_speed = -0.3
+
+        if self.state == State.CRUISE:
+            if emergency:
+                self.state = State.AVOID
+                self.state_start_time = now
+                self.avoid_direction = 1.0 if hdg_err > 0 else -1.0
+                self.get_logger().error(f"EMERGENCY: {threat_dir} @ {closest_front.distance:.1f}m")
+            elif threat:
+                self.state = State.AVOID
+                self.state_start_time = now
+                if "left" in threat_dir:
+                    self.avoid_direction = 1.0
+                elif "right" in threat_dir:
+                    self.avoid_direction = -1.0
+                else:
+                    # front_center: pick the side with more clearance
+                    fl = self.obstacle_ema.get("front_left", float('inf'))
+                    fr = self.obstacle_ema.get("front_right", float('inf'))
+                    if fl > fr:
+                        self.avoid_direction = 1.0   # go left
+                    else:
+                        self.avoid_direction = -1.0  # go right
+                self.get_logger().warn(f"AVOID: {threat_dir} @ {threat_dist:.1f}m")
+            else:
+                target_speed = self.MAX_SPEED
+                if abs(hdg_err) > 45.0:
+                    target_speed = self.MIN_SPEED
+                elif abs(hdg_err) > 15.0:
+                    target_speed = self.MIN_SPEED + (self.MAX_SPEED - self.MIN_SPEED) * ((45.0 - abs(hdg_err)) / 30.0)
+                if closest_front:
+                    d = closest_front.distance
+                    if d < warn_dist:
+                        target_speed = min(target_speed, self.MIN_SPEED + (self.MAX_SPEED - self.MIN_SPEED) * (d / warn_dist))
+                target_yaw_rate = float(np.clip(hdg_err * 2.5, -self.CRUISE_YAW_RATE, self.CRUISE_YAW_RATE))
+
+        elif self.state == State.AVOID:
+            if not threat or (closest_front and closest_front.distance > warn_dist * 1.2):
+                self.state = State.CRUISE
+                self.get_logger().info("-> CRUISE (clear)")
+            elif now - self.state_start_time > 0.8:
+                self.state = State.BYPASS
+                self.state_start_time = now
+                self.get_logger().info("-> BYPASS")
+            else:
+                target_speed = self.AVOID_FORWARD_SPEED if not emergency else -0.3
+                target_lateral = self.avoid_direction * self.AVOID_LATERAL_SPEED * 0.5
+                target_yaw_rate = self.avoid_direction * 45.0
+
+        elif self.state == State.BYPASS:
+            elapsed = now - self.state_start_time
+            if elapsed > self.BYPASS_DURATION_S:
+                if threat and closest_front and closest_front.distance < stop_dist * 1.5:
+                    self.state_start_time = now
+                    self.get_logger().warn("BYPASS extended")
+                else:
+                    self.state = State.RECOVER
+                    self.state_start_time = now
+                    self.last_avoid_time = now
+                    self.get_logger().info("-> RECOVER")
+            progress = elapsed / self.BYPASS_DURATION_S
+            target_speed = self.BYPASS_FORWARD + (self.MAX_SPEED * 0.5 - self.BYPASS_FORWARD) * progress
+            target_lateral = self.avoid_direction * self.AVOID_LATERAL_SPEED * (1.0 - progress * 0.3)
+            yaw_toward_track = float(np.clip(hdg_err * 2.0, -30.0, 30.0))
+            target_yaw_rate = self.avoid_direction * 25.0 + yaw_toward_track
+
+        elif self.state == State.RECOVER:
+            elapsed = now - self.state_start_time
+            if elapsed > self.RECOVER_DURATION_S:
+                self.state = State.CRUISE
+                self.get_logger().info("-> CRUISE")
+            target_speed = self.MAX_SPEED * 0.6
+            target_yaw_rate = float(np.clip(hdg_err * 3.0, -45.0, 45.0))
+
+        self.current_speed = self._ramp_value(self.current_speed, target_speed, self.SPEED_RAMP_RATE)
+        self.current_lateral = self._ramp_value(self.current_lateral, target_lateral, self.SPEED_RAMP_RATE * 0.8)
+        self.current_yaw_rate = self._ramp_value(self.current_yaw_rate, target_yaw_rate, self.YAW_RAMP_RATE)
+
+        return self.current_speed, self.current_lateral, 0.0, self.current_yaw_rate
+
+    def _advance_wp(self):
+        self.current_wp_idx = (self.current_wp_idx + 1) % len(self.WAYPOINTS)
+        self.get_logger().info(f"WP -> #{self.current_wp_idx} {self.WAYPOINTS[self.current_wp_idx]}")
+
+    def set_airborne(self, a, alt=0.0):
+        self.airborne = a
+        self.altitude = alt
+
+
+def heading_error(t, c):
+    t, c = t % 360, c % 360
+    d = t - c
+    if d > 180: d -= 360
+    elif d < -180: d += 360
+    return d
+
+
+def spin_ros2(n):
+    rclpy.spin(n)
+
+
+async def run():
+    rclpy.init()
+    node = Lidar3DAvoidance()
+    threading.Thread(target=spin_ros2, args=(node,), daemon=True).start()
+
+    drone = System()
+    await drone.connect(system_address="udp://:14540")
+
+    print("=" * 60)
+    print("3D LIDAR OBSTACLE AVOIDANCE v1.0")
+    print(f"Track: {node.WAYPOINTS}")
+    print(f"LiDAR topic: {node.LIDAR_TOPIC}")
+    print("=" * 60)
+
+    print("\n[1] GPS...")
+    async for h in drone.telemetry.health():
+        if h.is_global_position_ok:
+            print("    OK")
+            break
+
+    print("[2] Waiting for 3D LiDAR...")
+    for _ in range(60):
+        if node.lidar_count > 5:
+            print(f"    OK ({node.lidar_count} clouds)")
+            break
+        await asyncio.sleep(1.0)
+    if node.lidar_count <= 5:
+        print("    FAIL: No LiDAR data")
+        return
+
+    print("[3] Offboard...")
+    await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+    try:
+        await drone.offboard.start()
+    except OffboardError as e:
+        print(f"    FAIL: {e._result.result}")
+        return
+
+    print("[4] Takeoff to 5m...")
+    await drone.action.arm()
+    await asyncio.sleep(2)
+    await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, -2.0, 0.0))
+    await asyncio.sleep(5)
+    await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+    await asyncio.sleep(2)
+
+    node.set_airborne(True, 5.0)
+    print("[5] AIRBORNE - 3D LiDAR active")
+
+    try:
+        while True:
+            hdg = 0.0
+            alt = 5.0
+            pos_x = 0.0
+            pos_y = 0.0
+
+            async for h in drone.telemetry.heading():
+                hdg = h.heading_deg
+                break
+            async for p in drone.telemetry.position():
+                alt = p.relative_altitude_m
+                break
+            try:
+                async for odom in drone.telemetry.odometry():
+                    if odom.position_body:
+                        pos_x = odom.position_body.x_m
+                        pos_y = odom.position_body.y_m
+                    break
+            except:
+                pass
+
+            if alt < 1.0 and node.airborne:
+                alt = 5.0
+
+            fwd, lat, vert, yaw = node.update_state(hdg, pos_x, pos_y, alt)
+            vert += -(5.0 - alt) * 0.5
+            vert = float(np.clip(vert, -2.0, 1.0))
+
+            await drone.offboard.set_velocity_body(VelocityBodyYawspeed(fwd, lat, vert, yaw))
+
+            fl = node.obstacle_ema.get("front_left", float('inf'))
+            fc = node.obstacle_ema.get("front_center", float('inf'))
+            fr = node.obstacle_ema.get("front_right", float('inf'))
+            fl_s = f"{fl:.1f}" if fl < 99 else "--"
+            fc_s = f"{fc:.1f}" if fc < 99 else "--"
+            fr_s = f"{fr:.1f}" if fr < 99 else "--"
+
+            lidar_age = time.time() - node.last_lidar_time
+            lidar_health = "OK" if lidar_age < 1.0 else f"STALE({lidar_age:.1f}s)"
+
+            closest = node._get_closest(node._get_all_obstacles())
+            obs_str = f" | {closest.direction}:{closest.distance:.1f}m" if closest else ""
+
+            line = (f"\rState:{node.state.name:8s} | F:{fwd:5.2f} L:{lat:5.2f} | "
+                   f"FL:{fl_s} FC:{fc_s} FR:{fr_s} | LIDAR:{lidar_health} | "
+                   f"Pos:({pos_x:.1f},{pos_y:.1f}){obs_str}")
+            print(line, end="", flush=True)
+
+            await asyncio.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted")
+
+    print("[6] Land...")
+    node.set_airborne(False)
+    await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 1.0, 0.0))
+    await asyncio.sleep(5)
+    try:
+        await drone.offboard.stop()
+    except:
+        pass
+    await drone.action.disarm()
+    node.destroy_node()
+    rclpy.shutdown()
+    print("Done")
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
